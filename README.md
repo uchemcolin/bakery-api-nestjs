@@ -170,7 +170,7 @@ Federated logout clears both.
 
 Flow diagram:
 
-    ```mermaid
+```mermaid
 flowchart TD
     Browser["🌐 Browser"]
 
