@@ -1,55 +1,69 @@
 ================================================================================
-BAKERY API — NestJS + Keycloak (OIDC BFF)
+BAKERY API — NestJS + Keycloak (OIDC BFF with Personal Access Tokens)
 ================================================================================
 
 A secure NestJS API that acts as both an OpenID Connect (OIDC) client and
 Backend-for-Frontend (BFF) for a Nuxt 4 single-page application (SPA),
 using Keycloak as the identity provider.
 
-NestJS handles the entire OIDC authentication flow, including initiating
-login, exchanging the OIDC authorization code for tokens, mapping the
-external Keycloak identity to a local user, and creating and managing the
-authenticated server-side session. The API also serves as the resource
-server for the Nuxt frontend.
+NestJS handles the entire OIDC authentication flow: initiating login,
+exchanging the OIDC authorization code for tokens, mapping the external
+Keycloak identity to a local user, and issuing the application's own
+bearer token via a short-lived, one-time exchange code. The API also
+serves as the resource server for the Nuxt frontend.
 
 The Nuxt SPA never communicates directly with Keycloak and never receives,
 stores, or processes OIDC access tokens, ID tokens, or refresh tokens. It
 stores no authentication secrets and has no responsibility for the OIDC
-flow. Instead, it communicates exclusively with the NestJS BFF and can
-call endpoints such as /api/user to retrieve the currently authenticated
-user. NestJS returns the authenticated user when a valid server-side
-session exists, or 401 Unauthorized when the user is not authenticated.
+flow. Instead, it communicates exclusively with the NestJS BFF using an
+application-issued Bearer token, and can call endpoints such as /api/user
+to retrieve the currently authenticated user. NestJS returns the
+authenticated user when a valid bearer token is supplied, or 401
+Unauthorized when it is not.
 
-This architecture keeps all OIDC tokens and authentication logic on the
-server while providing the Nuxt SPA with a simple, secure session-based
-authentication interface.
+The browser redirect carries ONLY a short-lived one-time exchange code,
+never the application token itself. The Nuxt SPA POSTs that code to
+/api/auth/exchange and receives the real bearer token in the JSON
+response body.
 
 ================================================================================
 ARCHITECTURE
 ================================================================================
 
-```mermaid
-flowchart LR
-    Browser["🌐 Browser"]
+    Browser
+      |
+      | visits application
+      v
+    Nuxt SPA (localhost:3000)
+      |
+      |  GET  /sso/redirect          (browser navigation, session cookie)
+      |  POST /api/auth/exchange     (JSON, one-time code -> bearer token)
+      |  GET  /api/user              (Bearer token)
+      |  POST /api/logout            (Bearer token)
+      v
+    NestJS BFF (localhost:8001)
+      |
+      |  OIDC Authorization Code + PKCE
+      v
+    Keycloak (localhost:9000)
+      |
+      |  read / write users
+      v
+    SQLite (users, personal_access_tokens, auth_exchange_codes)
 
-    Nuxt["🟢 Nuxt SPA<br/>localhost:3000"]
+Two independent sessions exist:
 
-    Nest["🔵 NestJS BFF<br/>localhost:8001<br/><br/>OIDC + PKCE"]
+  1. Keycloak's SSO session (cookie on localhost:9000)
+     Owned by Keycloak. Determines whether the user is already logged in.
 
-    Keycloak["🔐 Keycloak<br/>localhost:9000"]
+  2. NestJS's temporary BFF session (cookie on localhost, used ONLY
+     during the OIDC round-trip to hold the PKCE verifier and state).
+     Destroyed immediately after the callback succeeds.
 
-    SQLite[("🗄️ SQLite<br/>users table")]
-
-    Browser -->|Visits application| Nuxt
-
-    Nuxt -->|GET /api/user| Nest
-    Nuxt -->|POST /api/logout| Nest
-    Nuxt -->|GET /sso/redirect| Nest
-
-    Nest <-->|OIDC + PKCE| Keycloak
-
-    Nest -->|Read / write users| SQLite
-```
+After the callback, authentication is performed with the application's
+own Personal Access Token (Bearer), not with the session cookie.
+Federated logout clears both the application token and the Keycloak
+SSO session.
 
 ================================================================================
 AUTHENTICATION FLOW
@@ -60,28 +74,47 @@ The user starts login from the Nuxt SPA.
 The browser is redirected to NestJS's /sso/redirect endpoint.
 
 NestJS generates a PKCE code verifier and code challenge, stores the
-verifier in the session, builds the Keycloak authorization URL, and
-redirects the browser to Keycloak.
+verifier and state in the temporary session, builds the Keycloak
+authorization URL, and redirects the browser to Keycloak.
 
 Keycloak authenticates the user and redirects the browser back to NestJS
 at /sso/callback with an authorization code.
 
-NestJS verifies the state parameter, exchanges the authorization code
-(plus the PKCE verifier) for tokens.
+NestJS verifies the state parameter and exchanges the authorization code
+(plus the PKCE verifier) for OIDC tokens.
 
 NestJS calls Keycloak's userinfo endpoint using the access token to fetch
 the user's profile.
 
-NestJS maps the OIDC issuer + subject to a local user via a Prisma upsert
-(the equivalent of Laravel's updateOrCreate).
+NestJS maps the OIDC issuer + subject to a local user via a Prisma upsert.
 
-NestJS stores the local user in the express-session session.
+NestJS creates a Personal Access Token for that user. Only the SHA-256
+hash of the token is stored in the database; the plaintext is held in
+memory just long enough to be placed inside an exchange code.
 
-The browser is redirected back to the Nuxt SPA dashboard.
+NestJS creates a short-lived (60 second), one-time exchange code whose
+SHA-256 hash is stored in auth_exchange_codes, and stores the plaintext
+application token alongside it in that row.
 
-The SPA calls /api/user using the session cookie.
+NestJS destroys the temporary BFF session and redirects the browser to:
 
-NestJS resolves and returns the authenticated user.
+    {FRONTEND_URL}/oauth/callback?code={exchangeCode}
+
+Only the exchange code reaches the browser. The application bearer token
+is NEVER placed in the redirect URL.
+
+The Nuxt SPA POSTs the code to /api/auth/exchange. NestJS consumes the
+code (marking it used and rejecting expired or already-used codes) and
+returns:
+
+    { "token": "<plaintext bearer token>", "token_type": "Bearer" }
+
+The SPA stores the bearer token and sends it on every subsequent request:
+
+    Authorization: Bearer <token>
+
+The SPA calls /api/user with the bearer token. NestJS resolves the token
+to a user via PersonalAccessTokenService.findValidToken and returns it.
 
 ================================================================================
 SECURITY MODEL
@@ -89,20 +122,29 @@ SECURITY MODEL
 
 Keycloak owns authentication and passwords.
 
-NestJS owns the application session and authorization.
+NestJS owns the application session, tokens, and authorization.
 
-OIDC tokens remain server-side.
+OIDC tokens remain server-side. The Nuxt SPA never sees them.
 
 The browser never receives the client secret.
 
 The SPA does not authenticate users itself.
 
-Session-based authentication is handled by express-session with an
-HttpOnly cookie and a custom SessionGuard.
+The application bearer token is delivered to the SPA only through a
+one-time exchange code. It never travels in a URL.
+
+Exchange codes and Personal Access Tokens are stored as SHA-256 hashes.
 
 PKCE (S256) is always used during the authorization code exchange.
 
-Federated logout terminates both the NestJS and Keycloak sessions.
+The temporary BFF session is destroyed immediately after the callback.
+
+Personal Access Tokens can be revoked (revokedAt) and can expire
+(expiresAt). Revoked and expired tokens are rejected. lastUsedAt is
+updated on every successful lookup.
+
+Federated logout revokes the current application token and returns the
+Keycloak end_session_endpoint so the SPA can terminate the SSO session.
 
 ================================================================================
 TECH STACK
@@ -112,9 +154,12 @@ Backend:        NestJS 11, TypeScript, Express (via @nestjs/platform-express)
 Identity:       Keycloak, OpenID Connect, OAuth 2.0, PKCE (S256)
 OIDC library:   openid-client v6
 Database:       SQLite via Prisma 6 and @prisma/adapter-better-sqlite3
-Sessions:       express-session (with passport for session plumbing)
+Sessions:       express-session (temporary BFF session only; passport for
+                session plumbing)
+Tokens:         Custom Personal Access Tokens (SHA-256 hashed, revocable)
 Frontend:       Nuxt 4
-Architecture:   Backend-for-Frontend (BFF), server-side sessions
+Architecture:   Backend-for-Frontend (BFF) with one-time exchange code and
+                bearer tokens
 
 ================================================================================
 TABLE OF CONTENTS
@@ -144,14 +189,18 @@ TABLE OF CONTENTS
 - Receives the authorization code at /sso/callback, exchanges it for tokens
 - Fetches the userinfo endpoint and maps the OIDC identity (issuer +
   subject) to a local user record via Prisma
-- Creates its own server-side session (cookie) after login
-- Shares that session with the Nuxt SPA running on a different port
-- Exposes /api/user and /api/logout behind a SessionGuard
-- Builds the Keycloak federated logout URL on logout
+- Issues the application's own Personal Access Token after login
+- Delivers that token to the SPA via a 60-second, one-time exchange code
+- Exposes POST /api/auth/exchange to trade the code for the token
+- Exposes GET /api/user and POST /api/logout behind an AccessTokenGuard
+- Hashes and stores PATs, supports expiry and revocation, and updates
+  lastUsedAt on each successful authentication
+- Builds the Keycloak federated logout URL on logout and revokes only the
+  token that authenticated the current request
 - Returns 401 for unauthenticated requests, 403 for unauthorized ones
 
-The Nuxt frontend is a thin client: it renders pages and calls the API. It
-never talks to Keycloak, never handles tokens, never stores secrets.
+The Nuxt frontend is a thin client: it renders pages, calls the API with
+a Bearer token, and never talks to Keycloak.
 
 ================================================================================
 2. ARCHITECTURE
@@ -162,38 +211,16 @@ Two independent sessions exist:
   1. Keycloak's SSO session (cookie on localhost:9000)
      Owned by Keycloak. Determines whether the user is already logged in.
 
-  2. NestJS's session (cookie on localhost, shared with the SPA)
-     Owned by this API. Determines whether the app recognizes the user.
+  2. NestJS's temporary BFF session (cookie on localhost)
+     Used only to hold the PKCE verifier and state during the OIDC
+     round-trip. It is destroyed as soon as the callback completes.
 
-The two are independent. Clearing one does not clear the other.
-Federated logout clears both.
+Authentication for normal API requests is NOT session-based. It uses the
+application's own Personal Access Token sent as a Bearer token in the
+Authorization header.
 
-Flow diagram:
-
-```mermaid
-flowchart TD
-    Browser["🌐 Browser"]
-
-    Nuxt["🟢 Nuxt SPA<br/>localhost:3000"]
-
-    Nest["🔵 NestJS BFF<br/>localhost:8001"]
-
-    Keycloak["🔐 Keycloak<br/>localhost:9000"]
-
-    SQLite[("🗄️ SQLite Database<br/>users table")]
-
-    Browser -->|Loads application| Nuxt
-
-    Nuxt -->|GET /api/user<br/>Session Cookie| Nest
-    Nuxt -->|POST /api/logout<br/>Session Cookie| Nest
-    Nuxt -->|GET /sso/redirect<br/>Browser Navigation| Nest
-
-    Nest -->|OIDC Authorization Code + PKCE| Keycloak
-
-    Keycloak -->|User / Identity Data| Nest
-
-    Nest -->|Read / Write Users| SQLite
-```
+The exchange-code layer exists because the browser redirect is untrusted
+for secrets: only a short-lived, single-use code ever appears in the URL.
 
 ================================================================================
 3. REQUIREMENTS
@@ -239,8 +266,8 @@ Check your Node version:
 
         mkdir -p database
 
-    Edit prisma/schema.prisma to add the User model. Full contents are
-    in Section 7.
+    Edit prisma/schema.prisma to add the User, PersonalAccessToken, and
+    AuthExchangeCode models. Full contents are in Section 7.
 
 4.4  Configure .env
 
@@ -260,29 +287,37 @@ Check your Node version:
 
     src/auth/oidc.service.ts. Full contents are in Section 7.
 
-4.8  Create the session guard
+4.8  Create the Personal Access Token service
 
-    src/auth/session.guard.ts. Full contents are in Section 7.
+    src/auth/personal-access-token.service.ts.
 
-4.9  Create the auth controller
+4.9  Create the auth exchange service
 
-    src/auth/auth.controller.ts. Full contents are in Section 7.
+    src/auth/auth-exchange.service.ts.
 
-4.10 Create the auth module
+4.10 Create the access token guard
 
-    src/auth/auth.module.ts. Full contents are in Section 7.
+    src/auth/access-token.guard.ts.
 
-4.11 Update app.module.ts and main.ts
+4.11 Create the auth controller
+
+    src/auth/auth.controller.ts.
+
+4.12 Create the auth module
+
+    src/auth/auth.module.ts.
+
+4.13 Update app.module.ts and main.ts
 
     Full contents are in Section 7.
 
-4.12 Start the server
+4.14 Start the server
 
     npm run start:dev
 
-    NestJS listens on http://localhost:8001.
+    NestJS listens on http://localhost:8001 (or the PORT you set).
 
-4.13 Ensure Keycloak and Nuxt are running
+4.15 Ensure Keycloak and Nuxt are running
 
     In separate terminals:
 
@@ -298,7 +333,8 @@ Check your Node version:
       database/
         database.sqlite                The SQLite database file
       prisma/
-        schema.prisma                  User model definition
+        schema.prisma                  User, PersonalAccessToken,
+                                       AuthExchangeCode models
         migrations/
           20260921084540_init/
             migration.sql
@@ -309,8 +345,12 @@ Check your Node version:
         auth/
           auth.module.ts               Wires everything together
           auth.controller.ts           SSO + API endpoints
+          auth-exchange.service.ts     One-time exchange codes
+          personal-access-token.service.ts  PAT creation / lookup /
+                                            revocation
+          access-token.guard.ts        Bearer token authentication guard
           oidc.service.ts              OIDC discovery + Configuration
-          session.guard.ts             Session authentication guard
+          session.guard.ts             (Optional) session guard
       package.json
       tsconfig.json
       nest-cli.json
@@ -342,7 +382,7 @@ Check your Node version:
     OIDC_CLIENT_SECRET=<paste-secret-from-keycloak>
     OIDC_REDIRECT_URI=http://localhost:8001/sso/callback
 
-    # Session
+    # Session (temporary BFF session during OIDC round-trip only)
     SESSION_SECRET=<a-long-random-string>
     SESSION_DOMAIN=localhost
     SESSION_SECURE_COOKIE=false
@@ -360,13 +400,14 @@ Check your Node version:
       Keycloak). In production, HTTPS is enforced by openid-client.
 
     SESSION_DOMAIN=localhost
-      Allows the session cookie to be shared between localhost:3000 (SPA)
-      and localhost:8001 (API). Without this, the SPA cannot send the
-      cookie to the API.
+      Allows the temporary BFF session cookie to be set during the OIDC
+      round-trip. With the token-based model, the SPA does not rely on
+      the session cookie for ordinary API calls.
 
     FRONTEND_URL
       Used for CORS and for the post-login redirect back to Nuxt. Must
-      match the origin Nuxt is actually served from.
+      match the origin Nuxt is actually served from. It also receives the
+      exchange code in /oauth/callback?code=...
 
     SESSION_SECURE_COOKIE=false
       Keep this false during development. Set to true in production
@@ -378,8 +419,8 @@ Check your Node version:
     NestJS      http://localhost:8001
     Nuxt        http://localhost:3000
 
-    Use localhost consistently (not 127.0.0.1). Cookie domains must match
-    between the SPA origin and the API origin.
+    Use localhost consistently (not 127.0.0.1). Cookie domains and CORS
+    origins must match.
 
 ================================================================================
 7. KEY FILES (FULL SOURCE)
@@ -399,15 +440,78 @@ datasource db {
 }
 
 model User {
-  id          Int      @id @default(autoincrement())
+  id Int @id @default(autoincrement())
+
   oidcIssuer  String?
   oidcSubject String?
-  name        String
-  email       String?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+
+  name  String
+  email String?
+
+  personalAccessTokens PersonalAccessToken[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@unique([oidcIssuer, oidcSubject])
+}
+
+model PersonalAccessToken {
+  id Int @id @default(autoincrement())
+
+  userId Int
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name String
+
+  // SHA-256 hash of the real bearer token.
+  // The plaintext token is never stored here.
+  tokenHash String @unique
+
+  // JSON string containing token abilities.
+  // Example: ["*"]
+  abilities String?
+
+  expiresAt DateTime?
+
+  // NULL = active. Non-NULL = revoked.
+  revokedAt DateTime?
+
+  lastUsedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([revokedAt])
+}
+
+model AuthExchangeCode {
+  id Int @id @default(autoincrement())
+
+  // SHA-256 hash of the one-time exchange code.
+  codeHash String @unique
+
+  // Local user receiving the application token.
+  userId Int
+
+  // The application bearer token that will be returned
+  // when this exchange code is consumed.
+  // This is NEVER placed in the redirect URL.
+  token String
+
+  // Exchange code expires after a short period.
+  expiresAt DateTime
+
+  // NULL = unused. Non-NULL = already consumed.
+  usedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([usedAt])
 }
 
 Note: There is NO password field. In a BFF setup, NestJS never stores
@@ -487,19 +591,173 @@ export class OidcService implements OnModuleInit {
     );
   }
 
-  // Public accessor. Controllers call `this.oidc.configuration`.
   get configuration(): client.Configuration {
     return this._configuration;
   }
 
-  // Convenience accessor for the logout handler.
   get endSessionEndpoint(): string | undefined {
     return this._configuration.serverMetadata().end_session_endpoint;
   }
 }
 
 --------------------------------------------------------------------------------
-7.4  src/auth/session.guard.ts
+7.4  src/auth/personal-access-token.service.ts
+--------------------------------------------------------------------------------
+
+import { Injectable } from '@nestjs/common';
+import { createHash, randomBytes } from 'crypto';
+
+import { PrismaService } from '../prisma.service';
+
+@Injectable()
+export class PersonalAccessTokenService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  /**
+   * Creates an application access token.
+   *
+   * The plaintext token is returned ONLY at creation time.
+   * Only its SHA-256 hash is stored in the database.
+   */
+  async createToken(
+    userId: number,
+    name = 'nuxt-app',
+    abilities: string[] = ['*'],
+  ) {
+    const randomPart = randomBytes(48).toString('hex');
+    const plainTextToken = `bkr_${randomPart}`;
+    const tokenHash = this.hashToken(plainTextToken);
+
+    const token = await this.prisma.personalAccessToken.create({
+      data: {
+        userId,
+        name,
+        tokenHash,
+        abilities: JSON.stringify(abilities),
+      },
+    });
+
+    return { token, plainTextToken };
+  }
+
+  hashToken(token: string): string {
+    return createHash('sha256').update(token).digest('hex');
+  }
+
+  /**
+   * Resolve a bearer token.
+   *
+   * Revoked and expired tokens are rejected.
+   */
+  async findValidToken(token: string) {
+    const tokenHash = this.hashToken(token);
+
+    const accessToken = await this.prisma.personalAccessToken.findUnique({
+      where: { tokenHash },
+      include: { user: true },
+    });
+
+    if (!accessToken) return null;
+    if (accessToken.revokedAt) return null;
+    if (accessToken.expiresAt && accessToken.expiresAt <= new Date()) {
+      return null;
+    }
+
+    await this.prisma.personalAccessToken.update({
+      where: { id: accessToken.id },
+      data: { lastUsedAt: new Date() },
+    });
+
+    return accessToken;
+  }
+
+  /**
+   * Revoke one token. Prisma's PersonalAccessToken.id is an Int.
+   */
+  async revokeToken(tokenId: number) {
+    return this.prisma.personalAccessToken.update({
+      where: { id: tokenId },
+      data: { revokedAt: new Date() },
+    });
+  }
+
+  /**
+   * Revoke all tokens belonging to a user.
+   */
+  async revokeAllUserTokens(userId: number) {
+    return this.prisma.personalAccessToken.updateMany({
+      where: { userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+  }
+}
+
+--------------------------------------------------------------------------------
+7.5  src/auth/auth-exchange.service.ts
+--------------------------------------------------------------------------------
+
+import { Injectable } from '@nestjs/common';
+import { createHash, randomBytes } from 'crypto';
+
+import { PrismaService } from '../prisma.service';
+
+@Injectable()
+export class AuthExchangeService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  /**
+   * Create a short-lived, one-time exchange code.
+   *
+   * The real application bearer token is stored server-side.
+   * Only the exchange code is sent through the browser redirect.
+   */
+  async create(userId: number, plainTextToken: string) {
+    const code = randomBytes(48).toString('hex');
+    const codeHash = this.hash(code);
+
+    await this.prisma.authExchangeCode.create({
+      data: {
+        codeHash,
+        userId,
+        token: plainTextToken,
+        expiresAt: new Date(Date.now() + 60 * 1000),
+      },
+    });
+
+    return code;
+  }
+
+  /**
+   * Consume the exchange code.
+   *
+   * Returns the stored application token if the code exists, has not
+   * expired, and has not already been used.
+   */
+  async consume(code: string) {
+    const codeHash = this.hash(code);
+
+    const record = await this.prisma.authExchangeCode.findUnique({
+      where: { codeHash },
+    });
+
+    if (!record) return null;
+    if (record.usedAt || record.expiresAt <= new Date()) return null;
+
+    await this.prisma.authExchangeCode.update({
+      where: { id: record.id },
+      data: { usedAt: new Date() },
+    });
+
+    return record;
+  }
+
+  private hash(value: string): string {
+    return createHash('sha256').update(value).digest('hex');
+  }
+}
+
+--------------------------------------------------------------------------------
+7.6  src/auth/access-token.guard.ts
 --------------------------------------------------------------------------------
 
 import {
@@ -508,34 +766,45 @@ import {
   Injectable,
   UnauthorizedException,
 } from '@nestjs/common';
-import type { Request } from 'express';
+
+import { Request } from 'express';
+
+import { PersonalAccessTokenService } from './personal-access-token.service';
 
 @Injectable()
-export class SessionGuard implements CanActivate {
-  canActivate(context: ExecutionContext): boolean {
+export class AccessTokenGuard implements CanActivate {
+  constructor(
+    private readonly tokens: PersonalAccessTokenService,
+  ) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
     const req = context.switchToHttp().getRequest<Request>();
-    const user = (req.session as any)?.user;
 
-    if (!user) {
-      throw new UnauthorizedException();
-    }
+    const authorization = req.headers.authorization;
+    if (!authorization) throw new UnauthorizedException();
+    if (!authorization.startsWith('Bearer ')) throw new UnauthorizedException();
 
-    (req as any).user = user;
+    const token = authorization.substring('Bearer '.length).trim();
+    if (!token) throw new UnauthorizedException();
+
+    const accessToken = await this.tokens.findValidToken(token);
+    if (!accessToken) throw new UnauthorizedException();
+
+    // Make the authenticated user and current token available.
+    (req as any).user = accessToken.user;
+    (req as any).accessToken = accessToken;
+
     return true;
   }
 }
 
 --------------------------------------------------------------------------------
-7.5  src/auth/auth.controller.ts
+7.7  src/auth/auth.controller.ts
 --------------------------------------------------------------------------------
 
 import {
-  Controller,
-  Get,
-  Post,
-  Req,
-  Res,
-  UseGuards,
+  Controller, Get, Post, Body, Req, Res, UseGuards,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { Request, Response } from 'express';
@@ -543,7 +812,9 @@ import * as client from 'openid-client';
 
 import { OidcService } from './oidc.service';
 import { PrismaService } from '../prisma.service';
-import { SessionGuard } from './session.guard';
+import { AccessTokenGuard } from './access-token.guard';
+import { PersonalAccessTokenService } from './personal-access-token.service';
+import { AuthExchangeService } from './auth-exchange.service';
 
 @Controller('sso')
 export class SsoController {
@@ -551,6 +822,8 @@ export class SsoController {
     private readonly oidc: OidcService,
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
+    private readonly tokens: PersonalAccessTokenService,
+    private readonly exchange: AuthExchangeService,
   ) {}
 
   @Get('redirect')
@@ -559,8 +832,8 @@ export class SsoController {
 
     const codeVerifier = client.randomPKCECodeVerifier();
     const codeChallenge = await client.calculatePKCECodeChallenge(codeVerifier);
-
     const state = client.randomState();
+
     (req.session as any).oidc = { codeVerifier, state };
 
     const authUrl = client.buildAuthorizationUrl(config, {
@@ -571,7 +844,7 @@ export class SsoController {
       state,
     });
 
-    res.redirect(authUrl.href);
+    return res.redirect(authUrl.href);
   }
 
   @Get('callback')
@@ -624,17 +897,29 @@ export class SsoController {
         },
       });
 
-      (req.session as any).user = {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        oidc_issuer: user.oidcIssuer,
-        oidc_subject: user.oidcSubject,
-      };
+      // Create our own application access token.
+      // The Keycloak access token is NOT given to Nuxt.
+      const createdToken = await this.tokens.createToken(
+        user.id,
+        'nuxt-app',
+        ['*'],
+      );
+
+      // Create a short-lived one-time exchange code.
+      // Only this code is placed in the browser redirect URL.
+      const exchangeCode = await this.exchange.create(
+        user.id,
+        createdToken.plainTextToken,
+      );
 
       delete (req.session as any).oidc;
 
-      return res.redirect(`${this.config.get('FRONTEND_URL')}/dashboard`);
+      req.session.destroy(() => {});
+
+      return res.redirect(
+        `${this.config.get('FRONTEND_URL')}/oauth/callback?code=` +
+          encodeURIComponent(exchangeCode),
+      );
     } catch (err) {
       console.error('OIDC callback failed:', err);
       return res.redirect(
@@ -649,67 +934,119 @@ export class ApiController {
   constructor(
     private readonly oidc: OidcService,
     private readonly config: ConfigService,
+    private readonly tokens: PersonalAccessTokenService,
+    private readonly exchange: AuthExchangeService,
   ) {}
 
+  /**
+   * POST /api/auth/exchange
+   *
+   * Converts the short-lived one-time authentication code into the
+   * application's personal access token.
+   */
+  @Post('auth/exchange')
+  async exchangeToken(@Body('code') code: string) {
+    if (!code) {
+      throw new UnauthorizedException('Authentication code is required.');
+    }
+
+    const record = await this.exchange.consume(code);
+
+    if (!record) {
+      throw new UnauthorizedException(
+        'Invalid or expired authentication code.',
+      );
+    }
+
+    return {
+      token: record.token,
+      token_type: 'Bearer',
+    };
+  }
+
+  /**
+   * GET /api/user
+   *
+   * Protected by the application's Bearer token.
+   */
   @Get('user')
-  @UseGuards(SessionGuard)
+  @UseGuards(AccessTokenGuard)
   async user(@Req() req: Request) {
     return (req as any).user;
   }
 
+  /**
+   * POST /api/logout
+   *
+   * Revokes the current application access token and returns the
+   * Keycloak federated logout URL.
+   */
   @Post('logout')
-  @UseGuards(SessionGuard)
+  @UseGuards(AccessTokenGuard)
   async logout(@Req() req: Request, @Res() res: Response) {
+    const accessToken = (req as any).accessToken;
+
+    // Revoke ONLY the token that authenticated this request.
+    await this.tokens.revokeToken(accessToken.id);
+
     const clientId = this.config.get<string>('OIDC_CLIENT_ID')!;
     const frontendUrl = this.config.get<string>('FRONTEND_URL')!;
 
-    req.session.destroy((err) => {
-      if (err) {
-        return res.status(500).json({ message: 'Session destruction error' });
-      }
+    let logoutUrl: string | null = null;
+    const endSession = this.oidc.endSessionEndpoint;
 
-      // Reuse the already-discovered configuration. Do NOT call
-      // client.discovery() again here — that would require re-applying
-      // the `allowInsecureRequests` escape hatch and risks HTTPS errors.
-      let logoutUrl: string | null = null;
-      const endSession = this.oidc.endSessionEndpoint;
+    if (endSession) {
+      const url = new URL(endSession);
+      url.searchParams.set('post_logout_redirect_uri', frontendUrl);
+      url.searchParams.set('client_id', clientId);
+      logoutUrl = url.href;
+    }
 
-      if (endSession) {
-        const url = new URL(endSession);
-        url.searchParams.set('post_logout_redirect_uri', frontendUrl);
-        url.searchParams.set('client_id', clientId);
-        logoutUrl = url.href;
-      }
-
-      return res.json({
-        message: 'Logged out',
-        logout_url: logoutUrl,
-      });
+    return res.json({
+      message: 'Logged out',
+      logout_url: logoutUrl,
     });
   }
 }
 
 --------------------------------------------------------------------------------
-7.6  src/auth/auth.module.ts
+7.8  src/auth/auth.module.ts
 --------------------------------------------------------------------------------
 
 import { Module } from '@nestjs/common';
 import { PassportModule } from '@nestjs/passport';
+
 import { SsoController, ApiController } from './auth.controller';
+
 import { OidcService } from './oidc.service';
 import { SessionGuard } from './session.guard';
+import { AccessTokenGuard } from './access-token.guard';
+
+import { PersonalAccessTokenService } from './personal-access-token.service';
+import { AuthExchangeService } from './auth-exchange.service';
+
 import { PrismaService } from '../prisma.service';
 
 @Module({
   imports: [PassportModule],
+
   controllers: [SsoController, ApiController],
-  providers: [OidcService, SessionGuard, PrismaService],
-  exports: [PrismaService],
+
+  providers: [
+    OidcService,
+    SessionGuard,
+    AccessTokenGuard,
+    PersonalAccessTokenService,
+    AuthExchangeService,
+    PrismaService,
+  ],
+
+  exports: [PrismaService, PersonalAccessTokenService],
 })
 export class AuthModule {}
 
 --------------------------------------------------------------------------------
-7.7  src/app.module.ts
+7.9  src/app.module.ts
 --------------------------------------------------------------------------------
 
 import { Module } from '@nestjs/common';
@@ -725,11 +1062,16 @@ import { AuthModule } from './auth/auth.module';
 export class AppModule {}
 
 --------------------------------------------------------------------------------
-7.8  src/main.ts
+7.10  src/main.ts
 --------------------------------------------------------------------------------
 
 import { NestFactory } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
+
+// express-session and passport are CommonJS modules. With esModuleInterop
+// enabled (NestJS default), we MUST use a default import. A namespace
+// import ("import * as session") produces an object that isn't callable
+// at runtime and throws "session is not a function".
 import session from 'express-session';
 import passport from 'passport';
 
@@ -741,7 +1083,7 @@ async function bootstrap() {
 
   app.enableCors({
     origin: config.get<string>('FRONTEND_URL'),
-    credentials: true,
+    // credentials: true,  // enable if the SPA sends cookies
   });
 
   app.use(
@@ -777,12 +1119,16 @@ bootstrap();
 8. ROUTES
 ================================================================================
 
-  Method   Path              Guard            Purpose
+  Method   Path                  Guard             Purpose
   ----------------------------------------------------------------------------
-  GET      /sso/redirect     —                Starts the OIDC flow
-  GET      /sso/callback     —                Handles Keycloak's redirect
-  GET      /api/user         SessionGuard     Returns the current user
-  POST     /api/logout       SessionGuard     Ends session + builds logout URL
+  GET      /sso/redirect         —                 Starts the OIDC flow
+  GET      /sso/callback         —                 Handles Keycloak's redirect;
+                                                    issues exchange code
+  POST     /api/auth/exchange    —                 Trades exchange code for
+                                                    the bearer token
+  GET      /api/user             AccessTokenGuard  Returns the current user
+  POST     /api/logout           AccessTokenGuard  Revokes current token +
+                                                    builds logout URL
 
 Verify the routes exist by checking the Nest startup logs:
 
@@ -790,6 +1136,7 @@ Verify the routes exist by checking the Nest startup logs:
     [RouterExplorer] Mapped {/sso/redirect, GET} route
     [RouterExplorer] Mapped {/sso/callback, GET} route
     [RoutesResolver] ApiController {/api}
+    [RouterExplorer] Mapped {/api/auth/exchange, POST} route
     [RouterExplorer] Mapped {/api/user, GET} route
     [RouterExplorer] Mapped {/api/logout, POST} route
 
@@ -812,18 +1159,23 @@ Verify the routes exist by checking the Nest startup logs:
 9.2  Verify unauthenticated requests return 401
 
     curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8001/api/user
-
     Expected: 401
+
+    curl -s -X POST http://localhost:8001/api/auth/exchange \
+      -H "Content-Type: application/json" -d '{}'
+    Expected: 401 (Authentication code is required.)
 
 9.3  Verify the database schema
 
     npx prisma studio
 
-    Opens a browser UI where you can inspect the User table.
+    Inspect the User, PersonalAccessToken, and AuthExchangeCode tables.
 
     From the CLI:
 
-    sqlite3 database/database.sqlite ".schema users"
+    sqlite3 database/database.sqlite ".tables"
+    sqlite3 database/database.sqlite ".schema personal_access_tokens"
+    sqlite3 database/database.sqlite ".schema auth_exchange_codes"
 
     The User table should NOT have a password column.
 
@@ -835,6 +1187,17 @@ Verify the routes exist by checking the Nest startup logs:
     Expected:
 
       "end_session_endpoint": "http://localhost:9000/realms/myapp/protocol/openid-connect/logout"
+
+9.5  End-to-end smoke test
+
+    1. Open the Nuxt SPA and click "Login".
+    2. Authenticate at Keycloak.
+    3. Confirm the browser lands on
+         {FRONTEND_URL}/oauth/callback?code=...
+       (the code is a hex string; the token is NOT in the URL).
+    4. Confirm the SPA POSTs the code to /api/auth/exchange and stores
+       the returned bearer token.
+    5. Confirm GET /api/user with the bearer token returns the user.
 
 ================================================================================
 10. COMMON ERRORS AND FIXES
@@ -957,8 +1320,7 @@ Fix:
 
     FRONTEND_URL=http://localhost:3001
 
-  Remember to also update Keycloak's "Valid post logout redirect URIs"
-  to match.
+  Remember to also update Keycloak's "Valid post logout redirect URIs".
 
 10.9  Invalid parameter: redirect_uri
 
@@ -978,8 +1340,7 @@ Fix:
 
 Cause:
   The post_logout_redirect_uri sent by NestJS does not exactly match
-  what is registered in Keycloak. A trailing slash makes them different
-  strings.
+  what is registered in Keycloak. A trailing slash makes them different.
 
 Fix:
   In Keycloak -> Clients -> nuxt-nestjs-bakery -> Settings ->
@@ -994,13 +1355,28 @@ Cause:
 
 Fix:
   Rename the private backing field to `_configuration` and keep the
-  public getter named `configuration`:
+  public getter named `configuration`.
 
-    private _configuration!: client.Configuration;
+10.12 Invalid or expired authentication code
 
-    get configuration(): client.Configuration {
-      return this._configuration;
-    }
+Cause:
+  POST /api/auth/exchange was called with a missing, already-consumed,
+  or expired (>60s) code. Exchange codes are single-use by design.
+
+Fix:
+  Re-run the OIDC flow to obtain a fresh code. Do not retry the same
+  code.
+
+10.13 401 on /api/user even after logging in
+
+Cause:
+  The Authorization: Bearer <token> header is missing, malformed, or
+  contains a token whose hash is not in personal_access_tokens, or the
+  token was revoked or has expired.
+
+Fix:
+  Confirm the SPA stored the token returned by /api/auth/exchange and
+  is sending it as `Authorization: Bearer <token>` on every request.
 
 ================================================================================
 11. PRODUCTION MIGRATION CHECKLIST
@@ -1011,19 +1387,19 @@ following values change. No source code changes are required.
 
 11.1  .env diff
 
-  Variable                      Local                              Production
+  Variable                      Local                               Production
   ------------------------------------------------------------------------------
-  NODE_ENV                      development                        production
-  PORT                          8001                               8000 (or as needed)
-  APP_URL                       http://localhost:8001              https://api.company.com
-  FRONTEND_URL                  http://localhost:3000              https://app.company.com
-  OIDC_ISSUER_URL               http://localhost:9000/realms/myapp https://login.company.com/realms/myapp
-  OIDC_CLIENT_ID                nuxt-nestjs-bakery                 <production-client-id>
-  OIDC_CLIENT_SECRET            <local-secret>                     <production-secret>
-  OIDC_REDIRECT_URI             http://localhost:8001/sso/callback https://api.company.com/sso/callback
-  SESSION_DOMAIN                localhost                          .company.com
-  SESSION_SECURE_COOKIE         false                              true
-  DATABASE_URL                  SQLite file                        PostgreSQL/MySQL connection string
+  NODE_ENV                      development                         production
+  PORT                          8001                                8000 (or as needed)
+  APP_URL                       http://localhost:8001               https://api.company.com
+  FRONTEND_URL                  http://localhost:3000               https://app.company.com
+  OIDC_ISSUER_URL               http://localhost:9000/realms/myapp  https://login.company.com/realms/myapp
+  OIDC_CLIENT_ID                nuxt-nestjs-bakery                  <production-client-id>
+  OIDC_CLIENT_SECRET            <local-secret>                      <production-secret>
+  OIDC_REDIRECT_URI             http://localhost:8001/sso/callback  https://api.company.com/sso/callback
+  SESSION_DOMAIN                localhost                           .company.com
+  SESSION_SECURE_COOKIE         false                               true
+  DATABASE_URL                  SQLite file                         PostgreSQL/MySQL connection string
 
 11.2  Additional production changes
 
@@ -1058,13 +1434,22 @@ following values change. No source code changes are required.
     should be coordinated with the Keycloak-side session timeout
     (Realm settings -> Sessions).
 
+  - Plan for PAT lifecycle. Decide on default expiresAt for tokens and
+    whether to add a rotation endpoint. The schema already supports
+    expiry and revocation.
+
+  - Add scheduled cleanup for consumed / expired auth_exchange_codes.
+    A simple cron or a periodic Prisma deleteMany is sufficient.
+
   - Back up both databases. NestJS's and Keycloak's.
 
 11.3  What does NOT change
 
   - src/auth/auth.controller.ts
   - src/auth/oidc.service.ts
-  - src/auth/session.guard.ts
+  - src/auth/access-token.guard.ts
+  - src/auth/personal-access-token.service.ts
+  - src/auth/auth-exchange.service.ts
   - The user mapping logic (oidcIssuer + oidcSubject)
   - The 401 / 403 distinction
   - The middleware registration
@@ -1101,40 +1486,57 @@ Rule 4 — 401 vs 403
 
 Rule 5 — Do not trust the frontend
 
-  The Nuxt SPA does not tell NestJS who the user is. It sends a
-  session cookie. NestJS independently resolves the user from that.
+  The Nuxt SPA does not tell NestJS who the user is. It presents a
+  bearer token. NestJS independently resolves the user from the token
+  hash.
 
 Rule 6 — Keep the client secret secret
 
   The OIDC_CLIENT_SECRET must live only in the API's .env. Never ship
   it to the browser. Never commit it to version control.
 
-Rule 7 — Session cookies must be HttpOnly and Secure
+Rule 7 — The bearer token never travels in a URL
 
-  In production, SESSION_SECURE_COOKIE=true and the session cookie is
-  HttpOnly. Together these prevent JavaScript access and require HTTPS.
+  The redirect from NestJS to the SPA carries ONLY a short-lived,
+  single-use exchange code. The real application token is delivered to
+  the SPA in the JSON body of POST /api/auth/exchange.
 
-Rule 8 — PKCE is mandatory
+Rule 8 — Store hashes, not secrets
+
+  Personal Access Tokens and exchange codes are stored only as SHA-256
+  hashes. A database leak does not expose usable credentials.
+
+Rule 9 — PKCE is mandatory
 
   openid-client v6 always uses PKCE (S256). The code verifier is stored
-  in the session between /sso/redirect and /sso/callback. Never
-  downgrade to the plain code flow.
+  in the temporary session between /sso/redirect and /sso/callback.
+  Never downgrade to the plain code flow.
 
-Rule 9 — Discover once, reuse everywhere
+Rule 10 — Discover once, reuse everywhere
 
   OidcService performs discovery a single time at startup. Every other
   part of the app (including the logout handler) reads from the cached
-  Configuration. Never call client.discovery() again at request time —
-  each call would need its own `allowInsecureRequests` escape hatch and
-  is easy to get wrong.
+  Configuration. Never call client.discovery() again at request time.
+
+Rule 11 — Revoke narrowly
+
+  POST /api/logout revokes ONLY the token that authenticated the
+  request, not all of the user's tokens. Use revokeAllUserTokens for
+  "log out everywhere".
+
+Rule 12 — Destroy the temporary session
+
+  The BFF session exists only to carry the PKCE verifier and state.
+  Destroy it immediately after a successful callback.
 
 ================================================================================
 13. RELATED PROJECTS
 ================================================================================
 
   bakery-spa      Nuxt 4 SPA that consumes this API.
-                  Delegates all authentication. Never handles tokens.
-                  See its README for full frontend setup.
+                  Delegates all authentication. Never handles OIDC tokens.
+                  Receives only an application bearer token, delivered
+                  via a one-time exchange code.
 
   Keycloak        The Identity Provider. Realm "myapp", confidential
                   client "nuxt-nestjs-bakery". See the project

@@ -1,12 +1,5 @@
-// Prisma schema — this is the single source of truth for your database.
-// We mirror the Laravel `users` migration but drop the password column:
-// in a BFF, Laravel/NestJS never stores passwords.
 generator client {
   provider = "prisma-client-js"
-  // We intentionally do NOT set a custom `output` path here.
-  // When you set a custom output (e.g. "../src/generated/prisma"), SQLite
-  // relative paths like `file:./dev.db` break because Prisma resolves
-  // them relative to the generated client, not the project root.
 }
 
 datasource db {
@@ -15,24 +8,80 @@ datasource db {
 }
 
 model User {
-  // Auto-incrementing integer primary key, same as Laravel's $table->id().
-  id          Int      @id @default(autoincrement())
+  id Int @id @default(autoincrement())
 
-  // `oidcIssuer` + `oidcSubject` together uniquely identify a user
-  // across the IdP. This is the SSO identity mapping from the PDF.
   oidcIssuer  String?
   oidcSubject String?
 
-  // Basic profile fields we mirror from the Keycloak userinfo endpoint.
-  name        String
-  email       String?
+  name  String
+  email String?
 
-  // Timestamps mirror Laravel's ->timestamps().
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  personalAccessTokens PersonalAccessToken[]
 
-  // The unique constraint mirrors Laravel's:
-  // $table->unique(['oidc_issuer', 'oidc_subject']);
-  // Prisma needs a name for the compound unique so we can query it later.
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
   @@unique([oidcIssuer, oidcSubject])
+}
+
+model PersonalAccessToken {
+  id Int @id @default(autoincrement())
+
+  userId Int
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name String
+
+  // SHA-256 hash of the real bearer token.
+  // The plaintext token is never stored here.
+  tokenHash String @unique
+
+  // JSON string containing token abilities.
+  // Example: ["*"]
+  abilities String?
+
+  expiresAt DateTime?
+
+  // NULL = active.
+  // Non-NULL = revoked.
+  revokedAt DateTime?
+
+  lastUsedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([revokedAt])
+}
+
+model AuthExchangeCode {
+  id Int @id @default(autoincrement())
+
+  // SHA-256 hash of the one-time exchange code.
+  codeHash String @unique
+
+  // Local user receiving the application token.
+  userId Int
+
+  // The application bearer token that will be returned
+  // when this exchange code is consumed.
+  //
+  // This is NEVER placed in the redirect URL.
+  token String
+
+  // Exchange code expires after a short period.
+  expiresAt DateTime
+
+  // NULL = unused.
+  // Non-NULL = already consumed.
+  usedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([usedAt])
 }

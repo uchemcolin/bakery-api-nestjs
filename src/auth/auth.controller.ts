@@ -2,17 +2,35 @@ import {
   Controller,
   Get,
   Post,
+  Body,
   Req,
   Res,
   UseGuards,
+  UnauthorizedException,
 } from '@nestjs/common';
+
 import { ConfigService } from '@nestjs/config';
-import type { Request, Response } from 'express';
+
+import type {
+  Request,
+  Response,
+} from 'express';
+
 import * as client from 'openid-client';
 
 import { OidcService } from './oidc.service';
 import { PrismaService } from '../prisma.service';
-import { SessionGuard } from './session.guard';
+
+import { AccessTokenGuard } from './access-token.guard';
+
+import {
+  PersonalAccessTokenService,
+} from './personal-access-token.service';
+
+import {
+  AuthExchangeService,
+} from './auth-exchange.service';
+
 
 @Controller('sso')
 export class SsoController {
@@ -20,179 +38,351 @@ export class SsoController {
     private readonly oidc: OidcService,
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
+    private readonly tokens: PersonalAccessTokenService,
+    private readonly exchange: AuthExchangeService,
   ) {}
 
   /**
    * GET /sso/redirect
    *
-   * Starts the OIDC authorization code flow with PKCE.
+   * Starts the OIDC Authorization Code + PKCE flow.
    */
   @Get('redirect')
-  async redirect(@Req() req: Request, @Res() res: Response) {
-    const config = this.oidc.configuration;
+  async redirect(
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    const config =
+      this.oidc.configuration;
 
-    // 1. Generate PKCE values.
-    const codeVerifier = client.randomPKCECodeVerifier();
-    const codeChallenge = await client.calculatePKCECodeChallenge(codeVerifier);
+    const codeVerifier =
+      client.randomPKCECodeVerifier();
 
-    // 2. Store the verifier and a random `state` in the session.
-    const state = client.randomState();
-    (req.session as any).oidc = { codeVerifier, state };
+    const codeChallenge =
+      await client.calculatePKCECodeChallenge(
+        codeVerifier,
+      );
 
-    // 3. Build the authorization URL.
-    const authUrl = client.buildAuthorizationUrl(config, {
-      redirect_uri: this.config.get<string>('OIDC_REDIRECT_URI')!,
-      scope: 'openid profile email',
-      code_challenge: codeChallenge,
-      code_challenge_method: 'S256',
+    const state =
+      client.randomState();
+
+    (req.session as any).oidc = {
+      codeVerifier,
       state,
-    });
+    };
 
-    // 4. Redirect the browser to Keycloak.
-    res.redirect(authUrl.href);
+    const authUrl =
+      client.buildAuthorizationUrl(
+        config,
+        {
+          redirect_uri:
+            this.config.get<string>(
+              'OIDC_REDIRECT_URI',
+            )!,
+
+          scope:
+            'openid profile email',
+
+          code_challenge:
+            codeChallenge,
+
+          code_challenge_method:
+            'S256',
+
+          state,
+        },
+      );
+
+    return res.redirect(
+      authUrl.href,
+    );
   }
+
 
   /**
    * GET /sso/callback
    *
-   * Keycloak redirects here after the user authenticates.
+   * Keycloak redirects here after authentication.
    */
   @Get('callback')
-  async callback(@Req() req: Request, @Res() res: Response) {
-    const config = this.oidc.configuration;
-    const stored = (req.session as any).oidc;
+  async callback(
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    const config =
+      this.oidc.configuration;
+
+    const stored =
+      (req.session as any).oidc;
 
     if (!stored) {
       return res.redirect(
-        `${this.config.get('FRONTEND_URL')}/login?error=auth_failed`,
+        `${this.config.get('FRONTEND_URL')}` +
+        `/login?error=auth_failed`,
       );
     }
 
     try {
-      const currentUrl = new URL(
-        req.originalUrl,
-        this.config.get<string>('APP_URL')!,
-      );
+      const currentUrl =
+        new URL(
+          req.originalUrl,
+          this.config.get<string>(
+            'APP_URL',
+          )!,
+        );
 
-      // Exchange the code for tokens, verifying state and PKCE.
-      const tokens = await client.authorizationCodeGrant(config, currentUrl, {
-        pkceCodeVerifier: stored.codeVerifier,
-        expectedState: stored.state,
-      });
+      /*
+       * Exchange authorization code.
+       *
+       * openid-client validates:
+       *
+       * - authorization response
+       * - state
+       * - PKCE
+       */
+      const tokens =
+        await client.authorizationCodeGrant(
+          config,
+          currentUrl,
+          {
+            pkceCodeVerifier:
+              stored.codeVerifier,
 
-      // Fetch userinfo using the access token.
-      const userinfo = await client.fetchUserInfo(
-        config,
-        tokens.access_token,
-        tokens.claims()?.sub!,
-      );
+            expectedState:
+              stored.state,
+          },
+        );
 
-      const issuer = this.config.get<string>('OIDC_ISSUER_URL')!;
-      const subject = userinfo.sub;
+      const userinfo =
+        await client.fetchUserInfo(
+          config,
+          tokens.access_token,
+          tokens.claims()?.sub!,
+        );
 
-      // Upsert the local user (Laravel's updateOrCreate equivalent).
-      const user = await this.prisma.user.upsert({
-        where: {
-          oidcIssuer_oidcSubject: {
+      const issuer =
+        this.config.get<string>(
+          'OIDC_ISSUER_URL',
+        )!;
+
+      const subject =
+        userinfo.sub;
+
+      /*
+       * Map Keycloak identity to local user.
+       */
+      const user =
+        await this.prisma.user.upsert({
+          where: {
+            oidcIssuer_oidcSubject: {
+              oidcIssuer: issuer,
+              oidcSubject: subject,
+            },
+          },
+
+          update: {
+            name:
+              (userinfo.name as string) ||
+              'OIDC User',
+
+            email:
+              (userinfo.email as string) ||
+              null,
+          },
+
+          create: {
             oidcIssuer: issuer,
             oidcSubject: subject,
+
+            name:
+              (userinfo.name as string) ||
+              'OIDC User',
+
+            email:
+              (userinfo.email as string) ||
+              null,
           },
-        },
-        update: {
-          name: (userinfo.name as string) || 'OIDC User',
-          email: (userinfo.email as string) || null,
-        },
-        create: {
-          oidcIssuer: issuer,
-          oidcSubject: subject,
-          name: (userinfo.name as string) || 'OIDC User',
-          email: (userinfo.email as string) || null,
-        },
-      });
+        });
 
-      // Store the session user (what SessionGuard checks).
-      (req.session as any).user = {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        oidc_issuer: user.oidcIssuer,
-        oidc_subject: user.oidcSubject,
-      };
+      /*
+       * Create our own application access token.
+       *
+       * The Keycloak access token is NOT given to Nuxt.
+       */
+      const createdToken =
+        await this.tokens.createToken(
+          user.id,
+          'nuxt-app',
+          ['*'],
+        );
 
-      // Clean up temporary OIDC state.
+      /*
+       * Create a short-lived one-time exchange code.
+       *
+       * Only this code is placed in the browser redirect URL.
+       */
+      const exchangeCode =
+        await this.exchange.create(
+          user.id,
+          createdToken.plainTextToken,
+        );
+
+      /*
+       * OIDC session state is no longer required.
+       */
       delete (req.session as any).oidc;
 
-      return res.redirect(`${this.config.get('FRONTEND_URL')}/dashboard`);
-    } catch (err) {
-      console.error('OIDC callback failed:', err);
+      /*
+       * Destroy the temporary BFF session.
+       *
+       * Authentication after this point is performed
+       * using the application access token.
+       */
+      req.session.destroy(() => {});
+
+      /*
+       * Only the one-time code reaches the browser.
+       */
       return res.redirect(
-        `${this.config.get('FRONTEND_URL')}/login?error=auth_failed`,
+        `${this.config.get('FRONTEND_URL')}` +
+        `/oauth/callback?code=` +
+        encodeURIComponent(
+          exchangeCode,
+        ),
+      );
+
+    } catch (err) {
+      console.error(
+        'OIDC callback failed:',
+        err,
+      );
+
+      return res.redirect(
+        `${this.config.get('FRONTEND_URL')}` +
+        `/login?error=auth_failed`,
       );
     }
   }
 }
+
 
 @Controller()
 export class ApiController {
   constructor(
     private readonly oidc: OidcService,
     private readonly config: ConfigService,
+    private readonly tokens: PersonalAccessTokenService,
+    private readonly exchange: AuthExchangeService,
   ) {}
+
+  /**
+   * POST /api/auth/exchange
+   *
+   * Converts the short-lived one-time authentication code
+   * into the application's personal access token.
+   */
+  @Post('auth/exchange')
+  async exchangeToken(
+    @Body('code') code: string,
+  ) {
+    if (!code) {
+      throw new UnauthorizedException(
+        'Authentication code is required.',
+      );
+    }
+
+    const record =
+      await this.exchange.consume(
+        code,
+      );
+
+    if (!record) {
+      throw new UnauthorizedException(
+        'Invalid or expired authentication code.',
+      );
+    }
+
+    return {
+      token: record.token,
+      token_type: 'Bearer',
+    };
+  }
+
 
   /**
    * GET /api/user
    *
-   * Returns the currently authenticated user from the session.
+   * Protected by the application's Bearer token.
    */
   @Get('user')
-  @UseGuards(SessionGuard)
-  async user(@Req() req: Request) {
+  @UseGuards(AccessTokenGuard)
+  async user(
+    @Req() req: Request,
+  ) {
     return (req as any).user;
   }
+
 
   /**
    * POST /api/logout
    *
-   * Federated logout in two layers:
-   *   1. Destroy the local BFF session.
-   *   2. Return the Keycloak end_session_endpoint URL for the frontend
-   *      to navigate to, which clears Keycloak's SSO cookie.
-   *
-   * Note: This handler does NOT call client.discovery() again. It reuses
-   * the Configuration that OidcService already discovered at startup.
-   * This is critical because re-running discovery requires re-applying
-   * the `allowInsecureRequests` escape hatch, which is easy to forget.
+   * Revokes the current application access token
+   * and returns the Keycloak federated logout URL.
    */
   @Post('logout')
-  @UseGuards(SessionGuard)
-  async logout(@Req() req: Request, @Res() res: Response) {
-    const clientId = this.config.get<string>('OIDC_CLIENT_ID')!;
-    const frontendUrl = this.config.get<string>('FRONTEND_URL')!;
+  @UseGuards(AccessTokenGuard)
+  async logout(
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    const accessToken =
+      (req as any).accessToken;
 
-    // 1. Destroy the local session.
-    req.session.destroy((err) => {
-      if (err) {
-        return res.status(500).json({ message: 'Session destruction error' });
-      }
+    /*
+     * Revoke ONLY the token that authenticated
+     * this request.
+     */
+    await this.tokens.revokeToken(
+      accessToken.id,
+    );
 
-      // 2. Build the federated logout URL from the cached configuration.
-      let logoutUrl: string | null = null;
-      const endSession = this.oidc.endSessionEndpoint;
+    const clientId =
+      this.config.get<string>(
+        'OIDC_CLIENT_ID',
+      )!;
 
-      if (endSession) {
-        // NOTE: Keycloak does exact-string matching on the registered
-        // post-logout URI. Register `http://localhost:3000` WITHOUT a
-        // trailing slash in Keycloak and use the same value here.
-        const url = new URL(endSession);
-        url.searchParams.set('post_logout_redirect_uri', frontendUrl);
-        url.searchParams.set('client_id', clientId);
-        logoutUrl = url.href;
-      }
+    const frontendUrl =
+      this.config.get<string>(
+        'FRONTEND_URL',
+      )!;
 
-      return res.json({
-        message: 'Logged out',
-        logout_url: logoutUrl,
-      });
+    let logoutUrl:
+      string | null = null;
+
+    const endSession =
+      this.oidc.endSessionEndpoint;
+
+    if (endSession) {
+      const url =
+        new URL(endSession);
+
+      url.searchParams.set(
+        'post_logout_redirect_uri',
+        frontendUrl,
+      );
+
+      url.searchParams.set(
+        'client_id',
+        clientId,
+      );
+
+      logoutUrl =
+        url.href;
+    }
+
+    return res.json({
+      message: 'Logged out',
+      logout_url: logoutUrl,
     });
   }
 }

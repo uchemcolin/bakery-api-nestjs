@@ -25,7 +25,7 @@ async function bootstrap() {
   // request with a CORS error before it even reaches this server.
   app.enableCors({
     origin: config.get<string>('FRONTEND_URL'),
-    credentials: true,
+    //credentials: true,
   });
 
   // -------------------------------------------------------------------------
